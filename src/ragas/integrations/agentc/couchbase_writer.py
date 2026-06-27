@@ -1,173 +1,161 @@
-"""
-Writes agent evaluation results to Couchbase for storage and SQL++ querying.
-
-The documents are stored with the following structure, optimised for SQL++ analysis::
-
-    {
-      "id": "eval_abc123",
-      "type": "agent_evaluation",
-      "session_id": "<agentc session UUID>",
-      "span_name": ["root", "my_agent"],
-      "timestamp": "2026-06-27T12:00:00+00:00",
-      "metrics": {
-        "tool_step_efficiency": 0.85,
-        "agent_goal_accuracy": 0.9
-      },
-      "trace_summary": {
-        "total_tool_calls": 3,
-        "unique_tools": ["search", "calculate"],
-        "tool_sequence": ["search", "search", "calculate"],
-        "num_turns": 7
-      },
-      "metadata": { "catalog_version": { ... } },
-      "sample_preview": { "messages": [...], "reference": null }
-    }
-
-Example SQL++ queries::
-
-    -- Average scores by agent
-    SELECT span_name[0] AS agent, AVG(metrics.tool_step_efficiency) AS avg_efficiency
-    FROM `agent_evals`.`_default`.`evaluations`
-    WHERE type = 'agent_evaluation'
-    GROUP BY span_name[0];
-
-    -- Sessions with poor goal accuracy
-    SELECT session_id, metrics, trace_summary
-    FROM `agent_evals`.`_default`.`evaluations`
-    WHERE metrics.agent_goal_accuracy < 0.5;
-"""
+"""Couchbase writer for storing agent evaluation results."""
 
 from __future__ import annotations
 
-import typing as t
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CouchbaseConfig:
+    """Configuration for Couchbase connection."""
+
+    connection_string: str
+    username: str
+    password: str
+    bucket_name: str
+    scope_name: str = "_default"
+    collection_name: str = "agent_evaluations"
 
 
 class CouchbaseEvalWriter:
-    """Writes evaluation results to a Couchbase collection.
+    """Writer for storing agent evaluation results in Couchbase."""
 
-    Usage::
+    def __init__(self, config: CouchbaseConfig):
+        self.config = config
+        self._cluster = None
+        self._collection = None
 
-        with CouchbaseEvalWriter(
-            connection_string="couchbase://localhost",
-            username="Administrator",
-            password="password",
-            bucket="agent_evals",
-        ) as writer:
-            writer.write(results_json)
-    """
-
-    def __init__(
-        self,
-        connection_string: str,
-        username: str,
-        password: str,
-        bucket: str = "agent_evals",
-        scope: str = "_default",
-        collection: str = "evaluations",
-    ):
-        self.connection_string = connection_string
-        self.username = username
-        self.password = password
-        self.bucket_name = bucket
-        self.scope_name = scope
-        self.collection_name = collection
-        self._cluster: t.Any = None
-        self._collection: t.Any = None
-
-    def connect(self) -> None:
-        """Establish connection to the Couchbase cluster."""
+    def connect(self) -> "CouchbaseEvalWriter":
+        """Connect to Couchbase cluster."""
         try:
-            from datetime import timedelta
+            import datetime
+
             from couchbase.auth import PasswordAuthenticator
             from couchbase.cluster import Cluster
             from couchbase.options import ClusterOptions
+
+            auth = PasswordAuthenticator(self.config.username, self.config.password)
+            options = ClusterOptions(auth)
+            self._cluster = Cluster(self.config.connection_string, options)
+            self._cluster.wait_until_ready(datetime.timedelta(seconds=10))
+
+            bucket = self._cluster.bucket(self.config.bucket_name)
+            scope = bucket.scope(self.config.scope_name)
+            self._collection = scope.collection(self.config.collection_name)
+
+            logger.info(
+                "Connected to Couchbase at %s, bucket=%s, scope=%s, collection=%s",
+                self.config.connection_string,
+                self.config.bucket_name,
+                self.config.scope_name,
+                self.config.collection_name,
+            )
         except ImportError:
             raise ImportError(
-                "couchbase SDK not installed. Run: pip install couchbase"
+                "The 'couchbase' package is required to use CouchbaseEvalWriter. "
+                "Install it with: pip install couchbase"
             )
-
-        auth = PasswordAuthenticator(self.username, self.password)
-        self._cluster = Cluster(self.connection_string, ClusterOptions(auth))
-        self._cluster.wait_until_ready(timedelta(seconds=10))
-        bucket = self._cluster.bucket(self.bucket_name)
-        self._collection = bucket.scope(self.scope_name).collection(
-            self.collection_name
-        )
-
-    def write(self, results: t.List[t.Dict[str, t.Any]]) -> t.List[str]:
-        """Upsert evaluation result documents. Returns list of document IDs."""
-        if self._collection is None:
-            self.connect()
-        doc_ids = []
-        for result in results:
-            doc_id = result.get("id", f"eval_{hash(str(result))")
-            self._collection.upsert(doc_id, result)
-            doc_ids.append(doc_id)
-        return doc_ids
-
-    def write_one(self, result: t.Dict[str, t.Any]) -> str:
-        """Upsert a single evaluation result document."""
-        return self.write([result])[0]
-
-    def close(self) -> None:
-        if self._cluster is not None:
-            self._cluster.close()
-
-    def __enter__(self) -> "CouchbaseEvalWriter":
-        self.connect()
         return self
 
-    def __exit__(self, *args: t.Any) -> None:
+    def write(self, results: List[Dict[str, Any]]) -> int:
+        """Write a list of evaluation results to Couchbase. Returns count written."""
+        if self._collection is None:
+            raise RuntimeError("Not connected. Call connect() first.")
+
+        written = 0
+        for result in results:
+            try:
+                self.write_one(result)
+                written += 1
+            except Exception as e:
+                logger.error("Failed to write result %s: %s", result.get("id", "unknown"), e)
+
+        logger.info("Wrote %d/%d evaluation results to Couchbase", written, len(results))
+        return written
+
+    def write_one(self, result: Dict[str, Any]) -> None:
+        """Write a single evaluation result to Couchbase."""
+        if self._collection is None:
+            raise RuntimeError("Not connected. Call connect() first.")
+
+        doc_id = result.get("id") or f"eval_{hash(str(result))}"
+        self._collection.upsert(doc_id, result)
+        logger.debug("Wrote document %s", doc_id)
+
+    def close(self) -> None:
+        """Close the Couchbase connection."""
+        if self._cluster is not None:
+            self._cluster.close()
+            self._cluster = None
+            self._collection = None
+            logger.info("Closed Couchbase connection")
+
+    def __enter__(self) -> "CouchbaseEvalWriter":
+        return self.connect()
+
+    def __exit__(self, *args) -> None:
         self.close()
 
     @staticmethod
-    def example_queries() -> t.Dict[str, str]:
-        """Returns example SQL++ queries for analysing stored evaluations."""
+    def example_queries() -> Dict[str, str]:
+        """Return example SQL++ queries for analysing stored evaluation results."""
         return {
-            "avg_scores_by_agent": (
-                "SELECT span_name[0] AS agent_name,\n"
-                "       AVG(metrics.tool_step_efficiency) AS avg_efficiency,\n"
-                "       AVG(metrics.agent_goal_accuracy) AS avg_goal_accuracy,\n"
-                "       COUNT(*) AS num_sessions\n"
-                "FROM `agent_evals`.`_default`.`evaluations`\n"
-                "WHERE type = 'agent_evaluation'\n"
-                "GROUP BY span_name[0]\n"
-                "ORDER BY avg_goal_accuracy DESC;"
-            ),
-            "low_performing_sessions": (
-                "SELECT session_id, metrics, trace_summary.total_tool_calls,\n"
-                "       trace_summary.tool_sequence, timestamp\n"
-                "FROM `agent_evals`.`_default`.`evaluations`\n"
-                "WHERE type = 'agent_evaluation'\n"
-                "  AND (metrics.agent_goal_accuracy < 0.5\n"
-                "       OR metrics.tool_step_efficiency < 0.5)\n"
-                "ORDER BY timestamp DESC\n"
-                "LIMIT 20;"
-            ),
-            "tool_usage_frequency": (
-                "SELECT t AS tool_name, COUNT(*) AS call_count\n"
-                "FROM `agent_evals`.`_default`.`evaluations` AS e\n"
-                "UNNEST e.trace_summary.unique_tools AS t\n"
-                "WHERE e.type = 'agent_evaluation'\n"
-                "GROUP BY t\n"
-                "ORDER BY call_count DESC;"
-            ),
-            "daily_score_trend": (
-                "SELECT SUBSTR(timestamp, 0, 10) AS date,\n"
-                "       AVG(metrics.agent_goal_accuracy) AS avg_goal_accuracy,\n"
-                "       COUNT(*) AS num_evals\n"
-                "FROM `agent_evals`.`_default`.`evaluations`\n"
-                "WHERE type = 'agent_evaluation'\n"
-                "GROUP BY SUBSTR(timestamp, 0, 10)\n"
-                "ORDER BY date;"
-            ),
-            "sessions_with_excess_tool_calls": (
-                "SELECT session_id, trace_summary.total_tool_calls,\n"
-                "       trace_summary.tool_sequence,\n"
-                "       metrics.tool_step_efficiency\n"
-                "FROM `agent_evals`.`_default`.`evaluations`\n"
-                "WHERE trace_summary.total_tool_calls > 5\n"
-                "  AND metrics.tool_step_efficiency < 0.7\n"
-                "ORDER BY trace_summary.total_tool_calls DESC;"
-            ),
+            "avg_scores_by_agent": """
+-- Average metric scores grouped by agent (span_name)
+SELECT span_name,
+       AVG(metrics.tool_step_efficiency)        AS avg_tool_efficiency,
+       AVG(metrics.agent_response_faithfulness) AS avg_faithfulness,
+       COUNT(*)                                 AS num_evaluations
+FROM `{bucket}`.`{scope}`.`{collection}`
+WHERE type = 'agent_evaluation'
+GROUP BY span_name
+ORDER BY avg_faithfulness DESC;
+""",
+            "low_performing_sessions": """
+-- Sessions where any metric score fell below 0.5
+SELECT id, session_id, span_name, timestamp, metrics
+FROM `{bucket}`.`{scope}`.`{collection}`
+WHERE type = 'agent_evaluation'
+  AND (
+    metrics.tool_step_efficiency < 0.5
+    OR metrics.agent_response_faithfulness < 0.5
+    OR metrics.tool_sequence_completeness < 0.5
+  )
+ORDER BY timestamp DESC
+LIMIT 50;
+""",
+            "tool_usage_frequency": """
+-- Frequency of each tool used across all evaluated sessions
+SELECT tool, COUNT(*) AS usage_count
+FROM `{bucket}`.`{scope}`.`{collection}` AS e
+UNNEST e.trace_summary.tool_sequence AS tool
+WHERE e.type = 'agent_evaluation'
+GROUP BY tool
+ORDER BY usage_count DESC;
+""",
+            "daily_score_trend": """
+-- Daily average scores over time (requires ISO-8601 timestamps)
+SELECT DATE_TRUNC_STR(timestamp, 'day')        AS day,
+       AVG(metrics.tool_step_efficiency)        AS avg_efficiency,
+       AVG(metrics.agent_response_faithfulness) AS avg_faithfulness,
+       COUNT(*)                                 AS evaluations
+FROM `{bucket}`.`{scope}`.`{collection}`
+WHERE type = 'agent_evaluation'
+GROUP BY DATE_TRUNC_STR(timestamp, 'day')
+ORDER BY day DESC;
+""",
+            "sessions_with_excess_tool_calls": """
+-- Sessions that made more than 10 tool calls (potential over-use)
+SELECT id, session_id, span_name,
+       trace_summary.total_tool_calls,
+       metrics.tool_step_efficiency
+FROM `{bucket}`.`{scope}`.`{collection}`
+WHERE type = 'agent_evaluation'
+  AND trace_summary.total_tool_calls > 10
+ORDER BY trace_summary.total_tool_calls DESC;
+""",
         }
