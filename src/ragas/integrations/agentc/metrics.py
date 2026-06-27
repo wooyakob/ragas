@@ -53,6 +53,8 @@ class ToolStepEfficiency(MultiTurnMetric):
     With reference_tool_calls:
         score = min(actual, expected) / max(actual, expected)
         Perfect score 1.0 when counts match; penalises over- and under-use equally.
+        An empty reference (expected 0 tool calls) scores 1.0 when actual is also 0,
+        and 0.0 otherwise.
 
     Without reference_tool_calls (reference-free mode):
         score = max(0, 1 - (actual - 1) / max_penalised_calls)
@@ -79,15 +81,17 @@ class ToolStepEfficiency(MultiTurnMetric):
         self, sample: MultiTurnSample, callbacks: "Callbacks"
     ) -> float:
         actual = self._count_tool_calls(sample)
+
         if actual == 0:
-            # No tools called — score is perfect if no tools were expected
-            if sample.reference_tool_calls:
-                return 0.0
+            # No tools called — perfect only if reference also expects none
+            if sample.reference_tool_calls is not None:
+                return 1.0 if len(sample.reference_tool_calls) == 0 else 0.0
             return 1.0
 
-        if sample.reference_tool_calls:
+        if sample.reference_tool_calls is not None:
             expected = len(sample.reference_tool_calls)
             if expected == 0:
+                # Reference expected no tools but agent called some
                 return 0.0
             return min(actual, expected) / max(actual, expected)
 

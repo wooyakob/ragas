@@ -15,12 +15,15 @@ Log kinds handled:
 from __future__ import annotations
 
 import json
+import logging
 import typing as t
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ragas.dataset_schema import EvaluationDataset, MultiTurnSample
 from ragas.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -49,7 +52,7 @@ class AgentCTraceParser:
     def parse_file(self, path: t.Union[str, Path]) -> t.List[ParsedSession]:
         """Parse a JSONL activity log file into sessions."""
         logs: t.List[t.Dict] = []
-        with open(Path(path)) as f:
+        with open(Path(path), encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
@@ -141,10 +144,20 @@ class AgentCTraceParser:
         if not has_human or not has_ai or len(messages) < 2:
             return None
 
+        try:
+            sample = MultiTurnSample(user_input=messages)
+        except ValueError as e:
+            logger.warning(
+                "Skipping session %s — MultiTurnSample validation failed: %s",
+                session_id,
+                e,
+            )
+            return None
+
         return ParsedSession(
             session_id=session_id,
             span_name=span_name,
-            sample=MultiTurnSample(user_input=messages),
+            sample=sample,
             metadata=metadata,
             raw_logs=logs,
         )

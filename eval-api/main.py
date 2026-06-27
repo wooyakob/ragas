@@ -181,8 +181,20 @@ def evaluate(request: EvaluateRequest):
         sessions = run["sessions"]
 
         llm = _make_llm(request.llm_model, request.openai_api_key)
-        metrics = _build_metrics(request.metrics, llm=llm)
 
+        # Fail fast if faithfulness metric is requested but LLM could not be created
+        if "agent_response_faithfulness" in request.metrics and llm is None:
+            run["status"] = "error"
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "LLM creation failed. Provide a valid OpenAI API key via "
+                    "'openai_api_key' or the OPENAI_API_KEY environment variable "
+                    "to use 'agent_response_faithfulness'."
+                ),
+            )
+
+        metrics = _build_metrics(request.metrics, llm=llm)
         if not metrics:
             raise HTTPException(status_code=400, detail="No valid metrics selected.")
 
