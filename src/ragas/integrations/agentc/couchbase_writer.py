@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,13 @@ class CouchbaseEvalWriter:
             )
         return self
 
+    @staticmethod
+    def _fallback_doc_id(result: Dict[str, Any]) -> str:
+        """Derive a deterministic document ID from stable result fields."""
+        key = f"{result.get('session_id', '')}|{result.get('timestamp', '')}"
+        digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+        return f"eval_{digest}"
+
     def write(self, results: List[Dict[str, Any]]) -> int:
         """Write a list of evaluation results to Couchbase. Returns count written."""
         if self._collection is None:
@@ -82,7 +90,7 @@ class CouchbaseEvalWriter:
         if self._collection is None:
             raise RuntimeError("Not connected. Call connect() first.")
 
-        doc_id = result.get("id") or f"eval_{hash(str(result))}"
+        doc_id = result.get("id") or self._fallback_doc_id(result)
         self._collection.upsert(doc_id, result)
         logger.debug("Wrote document %s", doc_id)
 

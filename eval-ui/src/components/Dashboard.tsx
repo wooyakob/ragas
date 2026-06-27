@@ -13,7 +13,7 @@ export default function Dashboard({ setPage, lastResults }: Props) {
   if (lastResults.length > 0) {
     for (const k of Object.keys(lastResults[0].metrics)) {
       const vals = lastResults.map((r) => r.metrics[k]).filter((v) => v != null)
-      avgMetrics[k] = vals.reduce((a, b) => a + b, 0) / vals.length
+      avgMetrics[k] = vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0
     }
   }
 

@@ -91,15 +91,27 @@ async def health():
 
 
 @app.post("/parse")
-async def parse_traces(file: UploadFile = File(...)):
-    """Upload a JSONL activity log file and parse it into sessions."""
+def parse_traces(file: UploadFile = File(...)):
+    """
+    Upload a JSONL activity log file and parse it into sessions.
+
+    Uses a sync handler so FastAPI runs it in a thread pool, avoiding
+    event-loop blocking during JSON parsing of large files.
+    """
     try:
         from ragas.integrations.agentc.trace_parser import AgentCTraceParser
 
-        content = await file.read()
-        text = content.decode("utf-8")
-        lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+        # Use the synchronous SpooledTemporaryFile read since we're in a thread
+        content = file.file.read()
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(
+                status_code=400,
+                detail="File must be UTF-8 encoded. Please check your JSONL file encoding.",
+            )
 
+        lines = [ln for ln in text.strip().splitlines() if ln.strip()]
         if not lines:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
@@ -144,8 +156,15 @@ async def parse_traces(file: UploadFile = File(...)):
 
 
 @app.post("/evaluate")
-async def evaluate(request: EvaluateRequest):
-    """Run evaluation metrics on a previously parsed run."""
+def evaluate(request: EvaluateRequest):
+    """
+    Run evaluation metrics on a previously parsed run.
+
+    Uses a sync handler so FastAPI runs it in a thread pool. This is required
+    because ragas.evaluate() calls asyncio.run() internally; calling it from
+    an async handler would raise 'asyncio.run() cannot be called from a running
+    event loop'.
+    """
     run = _eval_store.get(request.run_id)
     if not run:
         raise HTTPException(
@@ -213,17 +232,12 @@ async def get_evaluation(run_id: str):
     run = _eval_store.get(run_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
-    # Exclude raw ParsedSession objects from JSON response
-    return {
-        k: v
-        for k, v in run.items()
-        if k != "sessions"
-    }
+    return {k: v for k, v in run.items() if k != "sessions"}
 
 
 @app.post("/save-to-couchbase")
-async def save_to_couchbase(request: SaveToCouchbaseRequest):
-    """Save evaluation results to Couchbase."""
+def save_to_couchbase(request: SaveToCouchbaseRequest):
+    """Save evaluation results to Couchbase (sync handler runs in thread pool)."""
     run = _eval_store.get(request.run_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"Run {request.run_id} not found.")
